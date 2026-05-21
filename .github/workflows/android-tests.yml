@@ -1,0 +1,465 @@
+name: Android Mobile Tests
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: 'Test suite to run (all, smoke, login, navigation, form, negative)'
+        required: false
+        default: 'all'
+        type: choice
+        options: [all, smoke, login, navigation, form, negative]
+
+# Cancel in-progress runs for the same branch/PR
+concurrency:
+  group: mobile-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+# Minimal permissions — only what's needed
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: '22'
+  JAVA_VERSION: '17'
+  ANDROID_API_LEVEL: '31'
+  ANDROID_TARGET: google_apis
+  ANDROID_ARCH: x86_64
+  EMULATOR_OPTIONS: >-
+    -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim
+  APPIUM_PORT: '4723'
+
+jobs:
+  # ============================================================
+  # JOB 1: Run Android tests
+  # ============================================================
+  test:
+    name: Android Tests (API 31)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    outputs:
+      test-result: ${{ steps.run-tests.outcome }}
+
+    steps:
+      # ── Setup ────────────────────────────────────────────────
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Install project dependencies
+        run: npm ci
+
+      # ── Appium ────────────────────────────────────────────────
+      - name: Install Appium
+        run: |
+          npm install -g appium
+          appium driver install uiautomator2
+          appium --version
+          appium driver list --installed
+
+      # ── Android Emulator ─────────────────────────────────────
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Cache AVD snapshot
+        uses: actions/cache@v4
+        id: avd-cache
+        with:
+          path: |
+            ~/.android/avd/*
+            ~/.android/adb*
+          key: avd-api${{ env.ANDROID_API_LEVEL }}-${{ env.ANDROID_TARGET }}-${{ env.ANDROID_ARCH }}-v5
+
+      - name: Create AVD and generate snapshot
+        if: steps.avd-cache.outputs.cache-hit != 'true'
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ env.ANDROID_API_LEVEL }}
+          target: ${{ env.ANDROID_TARGET }}
+          arch: ${{ env.ANDROID_ARCH }}
+          force-avd-creation: false
+          emulator-options: ${{ env.EMULATOR_OPTIONS }}
+          disable-animations: true
+          script: echo "AVD snapshot generated"
+
+      # ── Allure metadata ──────────────────────────────────────
+      - name: Generate Allure metadata
+        run: |
+          mkdir -p reports/allure-results
+
+          cat > reports/allure-results/environment.properties <<EOF
+          Platform=Android
+          API.Level=${{ env.ANDROID_API_LEVEL }}
+          App=ApiDemos-debug.apk
+          Framework=WebdriverIO 9.x
+          Runner=Appium 3.x / UiAutomator2
+          Node.js=${{ env.NODE_VERSION }}
+          Java=${{ env.JAVA_VERSION }}
+          CI=GitHub Actions
+          Branch=${{ github.ref_name }}
+          Commit=${{ github.sha }}
+          Run.ID=${{ github.run_id }}
+          Run.Number=${{ github.run_number }}
+          EOF
+
+          cat > reports/allure-results/executor.json <<EOF
+          {
+            "name": "GitHub Actions",
+            "type": "github",
+            "buildName": "#${{ github.run_number }}",
+            "buildOrder": ${{ github.run_number }},
+            "buildUrl": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+            "reportUrl": "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/${{ github.run_number }}/",
+            "reportName": "Allure Report #${{ github.run_number }}"
+          }
+          EOF
+
+      # ── Restore Allure history for trends ────────────────────
+      - name: Download previous Allure history
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: allure-history
+          path: reports/allure-history
+
+      - name: Copy Allure history into results
+        run: |
+          if [ -d reports/allure-history/history ]; then
+            cp -r reports/allure-history/history reports/allure-results/history
+            echo "Allure history restored from previous run"
+          else
+            echo "No previous Allure history found — first run"
+          fi
+
+      # ── Prepare test script ──────────────────────────────────
+      # WHY external file: android-emulator-runner@v2 parseScript()
+      # splits `script:` on newlines, running each as separate
+      # `sh -c "<line>"`. Multiline bash (functions, loops, traps)
+      # breaks. Writing to a file and calling `bash <file>` keeps
+      # everything in a single process.
+      - name: Prepare test script
+        run: |
+          SUITE_ARG=""
+          INPUT_SUITE="${{ github.event.inputs.suite || 'all' }}"
+          if [ "$INPUT_SUITE" != "all" ]; then
+            SUITE_ARG="--suite $INPUT_SUITE"
+          fi
+
+          cat > /tmp/run-tests.sh <<'ENDSCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          APPIUM_PID=""
+          APPIUM_LOG="/tmp/appium.log"
+          LOGCAT_LOG="/tmp/logcat.txt"
+          WS="${GITHUB_WORKSPACE:-.}"
+
+          cleanup() {
+            local rc=$?
+            echo ""
+            echo "=== Cleanup (exit code: $rc) ==="
+
+            adb logcat -d > "$LOGCAT_LOG" 2>/dev/null || true
+
+            mkdir -p "$WS/reports/logs"
+            cp "$APPIUM_LOG" "$WS/reports/logs/appium.log" 2>/dev/null || true
+            cp "$LOGCAT_LOG" "$WS/reports/logs/logcat.txt" 2>/dev/null || true
+
+            if [ -n "$APPIUM_PID" ] && kill -0 "$APPIUM_PID" 2>/dev/null; then
+              echo "Stopping Appium (PID: $APPIUM_PID)"
+              kill "$APPIUM_PID" 2>/dev/null || true
+              local w=0
+              while kill -0 "$APPIUM_PID" 2>/dev/null && [ $w -lt 5 ]; do
+                sleep 1; w=$((w + 1))
+              done
+              kill -9 "$APPIUM_PID" 2>/dev/null || true
+            fi
+
+            echo "=== Cleanup complete ==="
+            exit $rc
+          }
+          trap cleanup EXIT
+
+          # 1. Wait for emulator
+          echo "=== Waiting for emulator ==="
+          adb wait-for-device
+          TIMEOUT=120; ELAPSED=0
+          while true; do
+            STATUS="$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r\n' || echo "")"
+            [ "$STATUS" = "1" ] && { echo "Booted after ${ELAPSED}s"; break; }
+            [ "$ELAPSED" -ge "$TIMEOUT" ] && { echo "ERROR: Boot timeout (${TIMEOUT}s)"; adb devices -l; exit 1; }
+            sleep 2; ELAPSED=$((ELAPSED + 2))
+            [ $((ELAPSED % 10)) -eq 0 ] && echo "  Waiting... (${ELAPSED}s)"
+          done
+          adb devices -l
+
+          # 2. Disable animations
+          echo "=== Disabling animations ==="
+          adb shell settings put global window_animation_scale 0
+          adb shell settings put global transition_animation_scale 0
+          adb shell settings put global animator_duration_scale 0
+
+          # 3. Install APK (retry x3)
+          echo "=== Installing APK ==="
+          INSTALLED=false
+          for i in 1 2 3; do
+            adb install -r apps/ApiDemos-debug.apk 2>&1 && { echo "Installed (attempt $i)"; INSTALLED=true; break; }
+            echo "Attempt $i failed, retrying..."; sleep 3
+          done
+          [ "$INSTALLED" = false ] && { echo "ERROR: APK install failed"; exit 1; }
+          adb shell pm list packages | grep -q "io.appium.android.apis" || { echo "ERROR: Package not found"; exit 1; }
+
+          # 4. Start Appium
+          echo "=== Starting Appium ==="
+          appium --address 127.0.0.1 --port ${APPIUM_PORT:-4723} --log-timestamp > "$APPIUM_LOG" 2>&1 &
+          APPIUM_PID=$!
+
+          TIMEOUT=60; ELAPSED=0
+          while true; do
+            kill -0 "$APPIUM_PID" 2>/dev/null || { echo "ERROR: Appium died"; tail -30 "$APPIUM_LOG"; exit 1; }
+            curl -sf "http://127.0.0.1:${APPIUM_PORT:-4723}/status" > /dev/null 2>&1 && { echo "Appium ready (${ELAPSED}s)"; break; }
+            [ "$ELAPSED" -ge "$TIMEOUT" ] && { echo "ERROR: Appium timeout"; tail -30 "$APPIUM_LOG"; exit 1; }
+            sleep 2; ELAPSED=$((ELAPSED + 2))
+          done
+
+          # 5. Run tests
+          echo "========================================="
+          echo "=== Running tests                     ==="
+          echo "========================================="
+          SUITE_ARGS="${WDIO_SUITE_ARGS:-}"
+          timeout 600 npx wdio run wdio.conf.ts $SUITE_ARGS
+          ENDSCRIPT
+          chmod +x /tmp/run-tests.sh
+
+          echo "Suite: $INPUT_SUITE (args: $SUITE_ARG)"
+
+      # ── Run tests ────────────────────────────────────────────
+      - name: Run tests
+        id: run-tests
+        uses: reactivecircus/android-emulator-runner@v2
+        timeout-minutes: 15
+        env:
+          CI: 'true'
+          WDIO_SUITE_ARGS: ${{ github.event.inputs.suite && github.event.inputs.suite != 'all' && format('--suite {0}', github.event.inputs.suite) || '' }}
+        with:
+          api-level: ${{ env.ANDROID_API_LEVEL }}
+          target: ${{ env.ANDROID_TARGET }}
+          arch: ${{ env.ANDROID_ARCH }}
+          force-avd-creation: false
+          emulator-options: ${{ env.EMULATOR_OPTIONS }} -no-snapshot-save
+          disable-animations: true
+          script: bash /tmp/run-tests.sh
+
+      # ── Allure report generation ─────────────────────────────
+      - name: Copy categories.json for Allure
+        if: always()
+        run: |
+          mkdir -p reports/allure-results
+          if [ -f allure/categories.json ]; then
+            cp allure/categories.json reports/allure-results/categories.json
+          fi
+
+      - name: Generate Allure Report
+        if: always()
+        run: |
+          npx allure generate reports/allure-results \
+            --clean \
+            -o reports/allure-report \
+            || true
+
+      # ── Upload artifacts ─────────────────────────────────────
+      - name: Upload Allure Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: allure-results
+          path: reports/allure-results/
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Upload Allure Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: allure-report
+          path: reports/allure-report/
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Upload Allure history (for next run trends)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: allure-history
+          path: reports/allure-report/history/
+          retention-days: 90
+          if-no-files-found: ignore
+          overwrite: true
+
+      - name: Upload Screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failure-screenshots
+          path: reports/screenshots/
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Upload CI Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-logs
+          path: reports/logs/
+          retention-days: 14
+          if-no-files-found: ignore
+
+  # ============================================================
+  # JOB 2: Deploy Allure Report to GitHub Pages
+  # ============================================================
+  deploy-report:
+    name: Deploy Allure Report
+    needs: test
+    if: always() && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install allure-commandline
+        run: npm install allure-commandline
+
+      - name: Download Allure Results
+        uses: actions/download-artifact@v4
+        with:
+          name: allure-results
+          path: allure-results
+
+      # Restore full report history from gh-pages branch
+      - name: Checkout gh-pages history
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          path: gh-pages-data
+
+      - name: Restore Allure history from gh-pages
+        run: |
+          mkdir -p allure-results/history
+          if [ -d gh-pages-data/history ]; then
+            cp -r gh-pages-data/history/* allure-results/history/ 2>/dev/null || true
+            echo "History restored from gh-pages ($(ls allure-results/history/ | wc -l) files)"
+          elif [ -d gh-pages-data/latest/history ]; then
+            cp -r gh-pages-data/latest/history/* allure-results/history/ 2>/dev/null || true
+            echo "History restored from gh-pages/latest"
+          else
+            echo "No previous history found"
+          fi
+
+      - name: Generate Allure Report
+        run: npx allure generate allure-results --clean -o allure-report
+
+      # Build the deploy directory structure:
+      # /           → redirect to /latest/
+      # /latest/    → latest report
+      # /history/   → Allure history data (for trends)
+      # /<number>/  → archived run
+      - name: Prepare GitHub Pages content
+        run: |
+          mkdir -p pages-deploy/latest
+          mkdir -p "pages-deploy/${{ github.run_number }}"
+          mkdir -p pages-deploy/history
+
+          # Latest report
+          cp -r allure-report/* pages-deploy/latest/
+
+          # Archived by run number
+          cp -r allure-report/* "pages-deploy/${{ github.run_number }}/"
+
+          # Persist history for next run
+          if [ -d allure-report/history ]; then
+            cp -r allure-report/history/* pages-deploy/history/
+          fi
+
+          # Preserve previous archived runs from gh-pages
+          if [ -d gh-pages-data ]; then
+            for dir in gh-pages-data/*/; do
+              dirname="$(basename "$dir")"
+              # Copy only numbered directories (archived runs), skip latest/history
+              if [[ "$dirname" =~ ^[0-9]+$ ]] && [ "$dirname" != "${{ github.run_number }}" ]; then
+                cp -r "$dir" "pages-deploy/$dirname" 2>/dev/null || true
+              fi
+            done
+          fi
+
+          # Root index.html redirects to latest
+          cat > pages-deploy/index.html <<'INDEXEOF'
+          <!DOCTYPE html>
+          <html>
+          <head>
+            <meta http-equiv="refresh" content="0; url=latest/">
+            <title>Allure Report — Mobile Autotests</title>
+          </head>
+          <body>
+            <p>Redirecting to <a href="latest/">latest report</a>...</p>
+          </body>
+          </html>
+          INDEXEOF
+
+          # .nojekyll prevents GitHub Pages from ignoring underscore-prefixed files
+          touch pages-deploy/.nojekyll
+
+          echo "Pages content ready ($(du -sh pages-deploy | cut -f1))"
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./pages-deploy
+          publish_branch: gh-pages
+          keep_files: false
+          user_name: 'github-actions[bot]'
+          user_email: 'github-actions[bot]@users.noreply.github.com'
+          commit_message: 'deploy: allure report #${{ github.run_number }}'
+
+      - name: Print report URL
+        run: |
+          REPORT_URL="https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/"
+          echo "## Allure Report" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Link | URL |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|------|-----|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Latest | [${REPORT_URL}latest/](${REPORT_URL}latest/) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| This run | [${REPORT_URL}${{ github.run_number }}/](${REPORT_URL}${{ github.run_number }}/) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Report published at: ${REPORT_URL}"

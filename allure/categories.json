@@ -1,0 +1,31 @@
+[
+  {
+    "name": "Test defects",
+    "description": "Tests that found real application bugs",
+    "matchedStatuses": ["failed"],
+    "messageRegex": ".*AssertionError.*|.*expect.*"
+  },
+  {
+    "name": "Element not found",
+    "description": "UI elements were not found or not displayed",
+    "matchedStatuses": ["failed", "broken"],
+    "messageRegex": ".*not displayed.*|.*not existing.*|.*not found.*|.*NoSuchElement.*"
+  },
+  {
+    "name": "Timeout issues",
+    "description": "Operations that exceeded timeout limits",
+    "matchedStatuses": ["broken"],
+    "messageRegex": ".*timeout.*|.*Timeout.*|.*ETIMEDOUT.*"
+  },
+  {
+    "name": "Appium / Infrastructure",
+    "description": "Appium or emulator infrastructure failures",
+    "matchedStatuses": ["broken"],
+    "messageRegex": ".*session.*|.*ECONNREFUSED.*|.*WebDriverError.*|.*InvalidSessionIdError.*"
+  },
+  {
+    "name": "Skipped tests",
+    "description": "Tests that were intentionally skipped",
+    "matchedStatuses": ["skipped"]
+  }
+]

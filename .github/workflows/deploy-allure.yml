@@ -1,0 +1,123 @@
+name: Deploy Allure Report (Manual)
+
+# Manual deploy — re-publish from the latest test run artifacts
+# without re-running tests. Useful if Pages deploy failed or
+# you want to update the report with no code changes.
+on:
+  workflow_dispatch:
+    inputs:
+      run-id:
+        description: 'GitHub Actions run ID to deploy from (leave empty for latest)'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: deploy-allure
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '22'
+
+jobs:
+  deploy:
+    name: Deploy Allure Report to GitHub Pages
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install allure-commandline
+        run: npm install allure-commandline
+
+      - name: Download Allure Results from specified run
+        uses: actions/download-artifact@v4
+        with:
+          name: allure-results
+          path: allure-results
+          run-id: ${{ github.event.inputs.run-id || github.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Checkout gh-pages history
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          path: gh-pages-data
+
+      - name: Restore Allure history
+        run: |
+          mkdir -p allure-results/history
+          if [ -d gh-pages-data/history ]; then
+            cp -r gh-pages-data/history/* allure-results/history/ 2>/dev/null || true
+            echo "History restored"
+          elif [ -d gh-pages-data/latest/history ]; then
+            cp -r gh-pages-data/latest/history/* allure-results/history/ 2>/dev/null || true
+          fi
+
+      - name: Generate Allure Report
+        run: npx allure generate allure-results --clean -o allure-report
+
+      - name: Prepare GitHub Pages content
+        run: |
+          mkdir -p pages-deploy/latest pages-deploy/history
+
+          cp -r allure-report/* pages-deploy/latest/
+
+          if [ -d allure-report/history ]; then
+            cp -r allure-report/history/* pages-deploy/history/
+          fi
+
+          # Preserve archived runs
+          if [ -d gh-pages-data ]; then
+            for dir in gh-pages-data/*/; do
+              dirname="$(basename "$dir")"
+              [[ "$dirname" =~ ^[0-9]+$ ]] && cp -r "$dir" "pages-deploy/$dirname" 2>/dev/null || true
+            done
+          fi
+
+          cat > pages-deploy/index.html <<'EOF'
+          <!DOCTYPE html>
+          <html>
+          <head>
+            <meta http-equiv="refresh" content="0; url=latest/">
+            <title>Allure Report — Mobile Autotests</title>
+          </head>
+          <body>
+            <p>Redirecting to <a href="latest/">latest report</a>...</p>
+          </body>
+          </html>
+          EOF
+          touch pages-deploy/.nojekyll
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./pages-deploy
+          publish_branch: gh-pages
+          keep_files: false
+          user_name: 'github-actions[bot]'
+          user_email: 'github-actions[bot]@users.noreply.github.com'
+          commit_message: 'deploy: allure report (manual re-deploy)'
+
+      - name: Print report URL
+        run: |
+          REPORT_URL="https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/"
+          echo "## Allure Report (Manual Deploy)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Latest: [${REPORT_URL}latest/](${REPORT_URL}latest/)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Report published at: ${REPORT_URL}"
